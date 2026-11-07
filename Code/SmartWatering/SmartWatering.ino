@@ -2,7 +2,8 @@
   Умный полив — управление клапаном 2.
   Arduino Uno: A0 — влажность почвы, A1 — TDS, A2 — мутность,
   A3 — pH резервуара 3, D7 — вход IN2 реле клапана 2.
-  Пределы воды и калибровка почвы ниже приведены только как пример.
+  Пороговые значения воды приведены в физических единицах.
+  Калибровка датчиков обязательна до включения полива.
 */
 const byte SOIL_PIN = A0;
 const byte TDS_PIN = A1;
@@ -23,14 +24,30 @@ const int SOIL_DRY_ADC = 800;
 const int SOIL_WET_ADC = 350;
 const int SOIL_MIN_PERCENT = 40;
 
-// Примеры значений АЦП (0–1023), не ppm, NTU или pH.
-// Замените после калибровки каждого датчика.
-const int TDS_MIN_ADC = 100;
-const int TDS_MAX_ADC = 700;
-const int TURBIDITY_MIN_ADC = 300;
-const int TURBIDITY_MAX_ADC = 900;
-const int PH_MIN_ADC = 300;
-const int PH_MAX_ADC = 700;
+// Ориентиры для полива; их можно изменить для конкретного растения.
+const float TDS_MAX_MG_L = 450.0;      // строго ниже 450 мг/л
+const float TURBIDITY_MAX_NTU = 10.0; // предварительный порог: ниже 10 NTU
+const float PH_MIN = 6.5;
+const float PH_MAX = 8.4;
+
+// ОБЯЗАТЕЛЬНА калибровка каждым датчиком на двух эталонах.
+// Укажите реальные ADC и значения эталонов, затем измените флаг на true.
+// Заглушки 0, 0 намеренно не являются калибровкой.
+// Линейная интерполяция допустима только если она подтверждена для модели
+// датчика в измеряемом диапазоне. Для TDS важна температура воды.
+// Опорные точки должны охватывать применяемый диапазон: показания вне
+// двух точек отвергаются. Измерения и калибровку выполняйте при одинаковой
+// температуре; иначе нужна предусмотренная изготовителем компенсация.
+const bool WATER_SENSORS_CALIBRATED = false;
+struct Calibration {
+  int adc1;
+  float value1;
+  int adc2;
+  float value2;
+};
+const Calibration TDS_CAL = {0, 0.0, 0, 0.0};       // мг/л
+const Calibration TURBIDITY_CAL = {0, 0.0, 0, 0.0}; // NTU
+const Calibration PH_CAL = {0, 0.0, 0, 0.0};        // pH
 
 enum State { CHECK_SENSORS, WATERING, WAITING };
 State state = CHECK_SENSORS;
@@ -52,25 +69,44 @@ int readSoilPercent() {
   return constrain(percent, 0, 100);
 }
 
-bool inRange(int value, int minimum, int maximum) {
-  return value >= minimum && value <= maximum;
+// Reject uncalibrated, saturated, and out-of-calibration readings.
+bool calibratedValue(int raw, const Calibration &cal, float &value) {
+  if (cal.adc1 <= 0 || cal.adc1 >= 1023 ||
+      cal.adc2 <= 0 || cal.adc2 >= 1023 || cal.adc1 == cal.adc2 ||
+      cal.value1 == cal.value2 || raw <= 0 || raw >= 1023) return false;
+  int low = min(cal.adc1, cal.adc2);
+  int high = max(cal.adc1, cal.adc2);
+  if (raw < low || raw > high) return false;
+  value = cal.value1 + (float)(raw - cal.adc1) *
+          (cal.value2 - cal.value1) / (cal.adc2 - cal.adc1);
+  return true;
 }
 
 bool waterIsAcceptable() {
-  int tds = readAverage(TDS_PIN);
-  int turbidity = readAverage(TURBIDITY_PIN);
-  int ph = readAverage(PH_PIN);
+  int tdsRaw = readAverage(TDS_PIN);
+  int turbidityRaw = readAverage(TURBIDITY_PIN);
+  int phRaw = readAverage(PH_PIN);
+  Serial.print("TDS ADC: "); Serial.print(tdsRaw);
+  Serial.print(" | Turbidity ADC: "); Serial.print(turbidityRaw);
+  Serial.print(" | pH ADC: "); Serial.println(phRaw);
 
-  Serial.print("TDS ADC: ");
-  Serial.print(tds);
-  Serial.print(" | Мутность ADC: ");
-  Serial.print(turbidity);
-  Serial.print(" | pH ADC: ");
-  Serial.println(ph);
-
-  return inRange(tds, TDS_MIN_ADC, TDS_MAX_ADC) &&
-         inRange(turbidity, TURBIDITY_MIN_ADC, TURBIDITY_MAX_ADC) &&
-         inRange(ph, PH_MIN_ADC, PH_MAX_ADC);
+  if (!WATER_SENSORS_CALIBRATED) {
+    Serial.println("Water sensors not calibrated; valve stays closed.");
+    return false;
+  }
+  float tds, turbidity, ph;
+  if (!calibratedValue(tdsRaw, TDS_CAL, tds) ||
+      !calibratedValue(turbidityRaw, TURBIDITY_CAL, turbidity) ||
+      !calibratedValue(phRaw, PH_CAL, ph)) {
+    Serial.println("Invalid reading or outside calibration range.");
+    return false;
+  }
+  Serial.print("TDS mg/L: "); Serial.print(tds);
+  Serial.print(" | Turbidity NTU: "); Serial.print(turbidity);
+  Serial.print(" | pH: "); Serial.println(ph);
+  return tds >= 0.0 && tds < TDS_MAX_MG_L &&
+         turbidity >= 0.0 && turbidity < TURBIDITY_MAX_NTU &&
+         ph >= PH_MIN && ph <= PH_MAX;
 }
 
 void openValve() {
